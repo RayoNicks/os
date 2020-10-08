@@ -1,19 +1,11 @@
 ;FAT32文件系统DBR扇区
-;检测是否支持int 13h扩展功能
-;在FAT32文件系统中查找并加载启动文件
-;2020.2.24~2020.2.27
+;在第一扇区中增加了打印寄存器的代码
+;第一扇区加载第二和第三扇区
+;检测是否支持int 13h扩展功能，但是UEFI主板上的CHS过小
+;在FAT32文件系统中查找并加载操作系统
+;2020.2.27~2020.2.29
 
     org 0x7C00
-
-struc   DriveParametersPacket
-    .size           resw    1
-    .flags          resw    1
-    .cylinders      resd    1
-    .heads          resd    1
-    .sectors        resd    1
-    .TotalSectors   resd    2
-    .SectorSize     resw    1
-endstruc
 
 BasePointer     equ     0x7C00
 TotSecDisp      equ     -4
@@ -55,58 +47,32 @@ DBR_code_start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov bp, 0x7C00
+    mov bp, BasePointer
     mov sp, bp
     sti
 
     mov [bp + BS_DrvNum - $$], dl       ;保存驱动器号
-    mov byte [bp + int13Ext - $$], 0    ;nop指令清0
 
-    mov di, DBRLoaded
-    mov bx, 0x0007
+    push 0x0007
+    push DBRLoadedLen
+    push DBRLoaded
     call dply_msg
 
-    ;jmp not_supported
-
-    ;检测是否支持int 13h扩展
-    mov ah, 0x41
-    mov bx, 0x55AA
-    int 0x13
-    jc not_supported
-    cmp bx, 0xAA55
-    jne not_supported
-    test cl, 0x1
-    jz not_supported
-
-supported:
-    inc byte [bp + int13Ext - $$]
-    ;调用int 13h的48h功能获取驱动器信息
-    mov ah, 48h
-    sub sp, DriveParametersPacket_size
-    mov si, sp          ;经过Bochs测试，应该是si
-    mov word [si], DriveParametersPacket_size    ;空间是在栈上分配的，未初始化
+    ;调用int 13h的08h功能获取驱动器信息，UEFI主板上获取的CHS太小
+    mov ah, 0x8
     int 13h
     jc restart
-    mov eax, 0xFFFFFFFF
-    mov ebx, [si + DriveParametersPacket.TotalSectors + 4]
-    cmp ebx, 0
-    cmove eax, [si + DriveParametersPacket.TotalSectors]
-    add sp, DriveParametersPacket_size
-    push eax        ;[bp - 4] = 总扇区数目
-    jmp loading_secondary
+    ;pushad
+    ;call print_registers
+    ;popad
 
-not_supported:
-    ;调用int 13h的08h功能获取驱动器信息
-    mov ah,0x8
-    int 0x13
-    jc restart
     movzx ax, dh
     inc ax
     mov [bp + BPB_NumHeads - $$], ax
     movzx dx, cl
     and dx, 0x3f
     mov [bp + BPB_SecPerTrk - $$], dx
-    mul dx
+    mul dx          ;16位可以容纳扇区数 * 磁头数
     xchg cl, ch
     shr ch, 0x6
     inc cx
@@ -115,101 +81,155 @@ not_supported:
     push ax
 
     ;加载DBR辅助扇区
+DBRSecCnt   equ     2
 loading_secondary:
+    mov eax, [bp + BPB_SecPerTrk - $$]      ;扇区数和磁道数
+    push eax
     mov eax, [bp + BPB_HiddSec - $$]
     add eax, 12
-    mov cx, 1
+    cmp eax, [bp + TotSecDisp]
+    jae restart
+    push eax
+    call LBA_to_CHS
+    mov dl, byte [bp + BS_DrvNum - $$]
     mov bx, 0x7E00
-    call load_sector
+    mov ax, 0x0200 | DBRSecCnt
+    int 13h
+    jc restart
+check_boot_signature:
     cmp word [es:bx + 0x1FE], 0xAA55
     jne restart
-    jmp 0x000:0x7E00
+    add bx, [bp + BPB_BytesPerSec - $$]
+    dec al
+    jnz check_boot_signature
+    jmp detecting_int13_extensions
 
 restart:
-    mov di, BootFailed
-    mov bx, 0x0007
+    push 0x0007
+    push BootFailedLen
+    push BootFailed
     call dply_msg
     cbw
     int 16h
     int 19h
 
-;显示C语言风格字符串
-;es:di：字符串地址
-;bx：页码和颜色属性
-dply_msg:               ;和MBR中代码相同
+;在栈上构造要打印的字符串
+;eax=0xXXXXXXXX\r\n
+;参数2：寄存器值
+;参数1：寄存器名
+ParaRegName     equ     4
+ParaRegValue    equ     6
+VarNumber       equ     -10
+VarRegName      equ     -16
+print_single_register:
+    push bp
+    mov bp, sp
+    push 0x0A0D                         ;回车换行
+    sub sp, 8                           ;为数字分配空间
+    push '0x'                           ;直接编码为68 3078
+    push ' ='                           ;直接编码为68 203D
+    push 'e'                            ;扩展为16位的0x0065
+    pusha                               ;为局部变量分配空间之后再保存通用寄存器
+    lea si, [bp + ParaRegValue + 3]     ;si = &最高字节
+    lea di, [bp + VarNumber]
+    xor ah, ah
+    mov cx, 4
+next_byte:
+    std
+    lodsb
+    push si             ;si指向下一个打印字节
+    push ax             ;al保存当前打印字节
+    mov si, HexNumber
+    push si             ;si指向字符串表
+    shr ax, 4           ;取高4位
+    add si, ax
+    cld
+    movsb               ;[si] -> [di]
+    pop si              ;si指向字符串表
+    pop ax              ;al保存当前打印字节
+    and ax, 0xf         ;取低4位
+    add si, ax
+    movsb
+    pop si              ;si指向下一个打印字节
+    loop next_byte
+    mov si, [bp + ParaRegName]
+    lea di, [bp + VarRegName + 1]
+    movsw               ;寄存器名
+    push 0x0007
+    push 3 + 1 + 2 + 8 + 2
+    lea ax, [bp + VarRegName]
+    push ax
+    call dply_msg
+    popa
+    leave
+    ret 6
+
+;需调用者恢复寄存器
+;参数8：eax
+;参数7：ecx
+;参数6：edx
+;参数5：ebx
+;参数4：esp
+;参数3：ebp
+;参数2：esi
+;参数1：edi
+print_registers:
+    push bp
+    mov bp, sp
+    lea si, [bp + 32]   ;si = &eax
+    mov cx, 8
+    mov bx, GPRName
+next_register:
+    std
+    lodsd
+    push eax
+    push bx
+    call print_single_register
+    inc bx                      ;2个inc比add少1字节
+    inc bx
+    loop next_register
+    leave
+    ret
+
+;打印字符串
+;参数3：页码和颜色属性
+;参数2：字符串长度
+;参数1：字符串地址
+ParaStr     equ     4
+ParaSize    equ     6
+ParaAttr    equ     8
+dply_msg:
+    push bp
+    mov bp, sp
     pusha
+    mov bx, [bp + ParaAttr]
     mov ah, 0x03
     int 10h
-    xor ax, ax
-    mov cx, 0xFFFF
-    mov bp, di
-    repnz scasb
-    not cx
-    dec cx
+    mov cx, [bp + ParaSize]
+    mov bp, [bp + ParaStr]
     mov ax, 0x1301
     int 10h
     popa
-    ret
+    leave
+    ret 6
 
-struc   DiskAddressPacket
-    .size       resb    1   ;结构体大小
-    .reserved   resb    1   ;保留
-    .count      resw    1   ;传输扇区数目
-    .offset     resw    1   ;偏移
-    .base       resw    1   ;段基址
-    .start      resq    1   ;起始LBA
-endstruc
-
-;eax：LBA，cx：扇区个数，es:bx：加载地址
-;carry = 0成功
-load_sector:
-RetryCnt    equ     3
-    pusha
-    movzx ecx, cx
-    add eax, ecx
-    cmp eax, [bp + TotSecDisp]
-    ja load_sector_err
-    sub eax, ecx
-    cmp byte [bp + int13Ext - $$], 1
-    jne CHS_loading
-LBA_loading:
-    ;在栈上构造DiskAddressPacket
-    push dword 0x00000000
-    push eax
-    push es
-    push bx
-    push cx
-    push DiskAddressPacket_size     ;8位立即数会自动扩展为16位
-    mov si, sp
-    mov di, RetryCnt
-LBA_retry:
-    mov ah, 0x42
-    mov dl, [bp + BS_DrvNum - $$]
-    int 13h
-    jnc LBA_sector_loaded
-    dec di
-    je LBA_load_sector_err
-    xor ah, ah
-    int 13h
-    jmp LBA_retry
-LBA_load_sector_err:
-    add sp, DiskAddressPacket_size
-    popa
-    add sp, 2
-    jmp restart
-LBA_sector_loaded:
-    add sp, DiskAddressPacket_size
-    popa
-    ret
-CHS_loading:
-    mov di, RetryCnt
-CHS_retry:
-    push eax
-    push ecx
-    ;被除数最多24位，除数最多6位，商最多19位
-    ;因此使用64位被除数，32位除数，结果在32位寄存器中
+;将LBA转换为CHS
+;参数3：磁头数
+;参数2：扇区数
+;参数1：LBA
+;返回值在cx和dx中
+ParaLBA     equ     4
+ParaSecs    equ     8
+ParaHeads   equ     10
+VarCx       equ     -4
+VarDx       equ     -2
+LBA_to_CHS:
+    push bp
+    mov bp, sp
+    sub sp, 4       ;暂存返回值
+    pushad
     xor edx, edx
-    movzx ecx, word [bp + BPB_SecPerTrk - $$]
+    movzx ecx, word [bp + ParaSecs]
     div ecx
     mov cl, dl
     inc cl
@@ -217,43 +237,89 @@ CHS_retry:
     ;因此使用32位被除数，16位除数，结果在16位寄存器中
     mov edx, eax
     shr edx, 16
-    div word [bp + BPB_NumHeads - $$]
-    mov dh, [bp + BS_DrvNum - $$]
+    div word [bp + ParaHeads]
     xchg dl, dh
     mov ch, al
     shl ah, 6
     or cl, ah
-    mov ax, 0x0201
-    int 13h
-    jnc CHS_sector_loaded
-    dec di
-    je CHS_load_sector_err
-    xor ah, ah
-    int 13h
-    pop ecx
-    pop eax
-    jmp CHS_retry
-CHS_sector_loaded:
-    pop ecx
-    pop eax
-    add bx, [bp + BPB_BytesPerSec - $$]
-    inc eax
-    loop CHS_loading
-    popa
-    ret
-CHS_load_sector_err:
-    pop ecx
-    pop eax
-load_sector_err:
-    popa
-    add sp, 2
-    jmp restart
+    mov [bp + VarCx], cx
+    mov [bp + VarDx], dx
+    popad
+    pop cx
+    pop dx
+    leave
+    ret 8
 
-DBRLoaded:      db      'DBR loaded...', 0x0D, 0x0A, 0x00
-BootFailed:     db      'Boot failed.', 0x0D, 0x0A, 'Press any key to restart...', 0x0D, 0x0A, 0x00
+GPRName:        db      'axcxdxbxspbpsidi'
+HexNumber:      db      '0123456789ABCDEF'
+DBRLoaded:      db      'DBR loaded...', 0x0D, 0x0A
+DBRLoadedLen    equ     $ - DBRLoaded
+BootFailed:     db      'Boot failed.', 0x0D, 0x0A, 'Press any key to restart...', 0x0D, 0x0A
+BootFailedLen   equ     $ - BootFailed
 
     times 510 - ($ - $$) db 0x00
     db 0x55, 0xAA
+
+;------------------------------第二扇区------------------------------
+
+struc   DriveParametersPacket
+    .size           resw    1
+    .flags          resw    1
+    .cylinders      resd    1
+    .heads          resd    1
+    .sectors        resd    1
+    .TotalSectors   resd    2
+    .SectorSize     resw    1
+endstruc
+
+detecting_int13_extensions:
+    ;jmp loading_kernel
+    mov byte [bp + int13Ext - $$], 0        ;nop指令清0
+    mov dl, [bp + BS_DrvNum - $$]
+    mov ah, 0x41
+    mov bx, 0x55AA
+    int 13h
+    jc loading_kernel
+    cmp bx, 0xAA55
+    jne loading_kernel
+    test cl, 0x1
+    jz loading_kernel
+
+supported:
+    push 0x0007
+    push ExtensionsLen
+    push Extensions
+    call dply_msg
+    inc byte [bp + int13Ext - $$]
+    ;调用int 13h的48h功能获取驱动器信息
+    mov ah, 48h
+    sub sp, DriveParametersPacket_size          ;在栈上分配数据结构
+    mov si, sp                                  ;经过Bochs测试，应该是si
+    mov word [si], DriveParametersPacket_size
+    int 13h
+    jc restart
+
+    ;UEFI主板上48h功能获取的CHS依然不对，但是可以直接使用总扇区数
+    ;push esi
+    ;mov ebx, [si + DriveParametersPacket.cylinders]
+    ;mov ecx, [si + DriveParametersPacket.heads]
+    ;mov edi, [si + DriveParametersPacket.sectors]
+    ;mov eax, [si + DriveParametersPacket.TotalSectors]
+    ;mov edx, [si + DriveParametersPacket.TotalSectors + 4]
+    ;mov si, [si + DriveParametersPacket.SectorSize]
+    ;pushad
+    ;call print_registers
+    ;popad
+    ;pop esi
+
+    mov cx, [si + DriveParametersPacket.SectorSize]
+    mov [bp + BPB_BytesPerSec], cx
+    mov eax, 0xFFFFFFFF
+    mov ebx, [si + DriveParametersPacket.TotalSectors + 4]
+    cmp ebx, 0
+    cmove eax, [si + DriveParametersPacket.TotalSectors]
+    add sp, DriveParametersPacket_size
+    mov [bp + TotSecDisp], eax                  ;[bp - 4] = 总扇区数目
 
 struc ShortEntry
     .FileName           resb    11
@@ -269,11 +335,11 @@ struc ShortEntry
     .ClusLowWord        resw    1
     .size               resd    1
 endstruc
+FATSecDisp          equ     -8
+Clus2StartDisp      equ     -12
+FATCurrSecDisp      equ     -16
 
-FATSecDisp      equ     -8
-Clus2SecDisp    equ     -12
-FATCurrSecDisp  equ     -16
-
+loading_kernel:
     movzx ecx, word [bp + BPB_RsvdSecCnt - $$]
     add ecx, [bp + BPB_HiddSec - $$]
     push ecx                ;[bp - 8] = 第1个FAT表起始扇区
@@ -283,8 +349,8 @@ FATCurrSecDisp  equ     -16
     push eax                ;[bp - 12] = 第2簇起始扇区
     push dword 0xFFFFFFFF   ;[bp - 16] = 内存中的FAT表的扇区号
 
-FATOffset       equ     0x8000
-RootDirOffset   equ     0x8200
+FATOffset       equ     0x7000
+RootDirOffset   equ     0x7200
 
     mov eax, [bp + BPB_RootClus - $$]
     and eax, 0x0FFFFFFF                 ;仅低28位有效
@@ -296,11 +362,16 @@ scanning_root_dir_cluster:
     jb restart
     cmp eax, 0x0FFFFFF7
     jae restart
-    push eax        ;保存当前簇号
+    push eax                        ;保存当前簇号
+    movzx si, byte [bp + BPB_SecPerClus - $$]
+    push eax
     call cluster_to_sector
 loading_root_dir_sector:
+    push eax
+    push es
     mov bx, RootDirOffset
-    mov cx, 1
+    push bx
+    push 1
     call load_sector
     mov di, bx
     add bx, [bp + BPB_BytesPerSec - $$]
@@ -310,7 +381,7 @@ scanning_dir_entry:
     mov cx, ShortEntry.attribute - ShortEntry.FileName
     push di
     push si
-    mov si, BootMgr
+    mov si, Kernel
     repe cmpsb
     pop si
     pop di
@@ -318,24 +389,27 @@ scanning_dir_entry:
     add di, ShortEntry_size
     cmp di, bx
     jb scanning_dir_entry
-    inc eax
-    dec si
+    inc eax                         ;下一扇区
+    dec si                          ;剩余扇区
     jnz loading_root_dir_sector
-    pop eax         ;恢复当前簇号
-    call cal_next_cluster
+    ;pop eax                        ;恢复当前簇号
+    call cal_next_cluster           ;参数已经在栈中
     jmp scanning_root_dir_cluster
 
 file_not_found:
-    add sp, 4   ;平衡栈中eax
-    mov bx, 0x0007
-    mov di, BootMgr
+    add sp, 4           ;平衡栈中eax
+    push 0x0007
+    push 11
+    push Kernel
     call dply_msg
-    mov di, FileNotFound
+    push 0x0007
+    push NotFoundLen
+    push NotFound
     call dply_msg
     jmp restart
 
 file_found:
-    add sp, 4   ;平衡栈中eax
+    add sp, 4           ;平衡栈中eax
     mov ax, [di + ShortEntry.ClusHighWord]
     shl eax, 16
     mov ax, [di + ShortEntry.ClusLowWord]
@@ -346,25 +420,26 @@ file_found:
     jae restart
 
 loading_os_cluster:
-    push eax                                    ;保存当前簇号
-    call cluster_to_sector                      ;将eax中簇号转换为起始扇区
+    push eax                        ;保存当前簇号
+    push eax
+    call cluster_to_sector
     movzx cx, byte [bp + BPB_SecPerClus - $$]
-loading_os:
-    push cx
-    push es
-    mov es, [BootMgrSeg]
-    mov bx, 0x0000
-    mov cx, 1
+loading_os_sector:
+    push eax
+    mov dx, [KernelSeg]
+    push dx
+    xor bx, bx
+    push bx
+    push 1
     call load_sector
-    pop es
-    pop cx
+    ;更新段基址
     add bx, [bp + BPB_BytesPerSec - $$]
     shr bx, 4
-    add [BootMgrSeg], bx
+    add [KernelSeg], bx
     inc eax
-    loop loading_os
-    pop eax                                     ;恢复当前簇号
-    call cal_next_cluster
+    loop loading_os_sector
+    ;pop eax                        ;恢复当前簇号
+    call cal_next_cluster           ;参数已经在栈中
     cmp eax, 2
     jb restart
     cmp eax, 0x0FFFFFF7
@@ -374,86 +449,218 @@ loading_os:
     jmp loading_os_cluster
 
 file_loaded:
-    mov dl, [bp + BS_DrvNum - $$]
+    push 0x0007
+    push 11
+    push Kernel
+    call dply_msg
+    push 0x0007
+    push LoadedLen
+    push Loaded
+    call dply_msg
 
     ;测试autorun.inf
-    ;push ds
-    ;mov ax, 0x2000
-    ;mov ds, ax
-    ;mov si, 0x00
-    ;mov di, 0x8400
-    ;mov cx, 0x80
-    ;rep movsd
-    ;pop ds
-    ;mov di, 0x8400
-    ;mov bx, 0x0007
-    ;call dply_msg
-    ;jmp restart
+    ;call test_for_autorun
 
-    ;jmp $
-
+    mov dl, [bp + BS_DrvNum - $$]
     jmp 0x2000:0x0000
 
-;eax：当前簇
-;eax：扇区
-cluster_to_sector:
-    push edx
-    push esi
-    sub eax, 2
-    movzx esi, byte [bp + BPB_SecPerClus - $$]
-    mul esi
-    add eax, [bp + Clus2SecDisp]
-    pop esi
-    pop edx
-    ret
+Extensions:     db      'Int 13h extensions installed...', 0x0D, 0x0A
+ExtensionsLen   equ     $ - Extensions
 
-;eax：当前簇
-;eax：下一簇
-cal_next_cluster:
+Kernel          equ     BootMgr
+
+KernelSeg:      dw      0x2000
+BootMgr:        db      'BOOTMGR    ', 0x00
+AutoRun:        db      'AUTORUN INF', 0x00
+Loaded:         db      ' Loaded...', 0x0D, 0x0A
+LoadedLen       equ     $ - Loaded
+NotFound:       db      ' not found...', 0x0D, 0x0A
+NotFoundLen     equ     $ - NotFound
+
+
+    times 1022 - ($ - $$) db 0
+    db 0x55, 0xAA
+
+;------------------------------第三扇区------------------------------
+
+test_for_autorun:
+    mov di, 0x8400
+    push di
+    push ds
+    mov ax, 0x2000
+    mov ds, ax
+    mov si, 0x00
+    mov cx, 0x80
+    rep movsd
+    pop ds
+    pop di
+    mov bx, 0x0007
+    push 0x0007
+    mov cx, 0xFFFF
+    repnz scasb
+    not cx
+    dec cx
     push cx
-    push edx
-    push bx
+    push 0x8400
+    call dply_msg
+    jmp $
+
+;将簇号转换为首扇区号
+;参数1：簇
+;返回值在eax中
+ParaCluster     equ     4
+VarSector       equ     -4
+cluster_to_sector:
+    push bp
+    mov bp, sp
+    sub sp, 4       ;返回值
+    pushad
+    mov eax, [bp + ParaCluster]
+    sub eax, 2
+    movzx ecx, byte [BPB_SecPerClus]
+    mul ecx
+    add eax, [BasePointer + Clus2StartDisp]
+    mov [bp + VarSector], eax
+    popad
+    pop eax
+    leave
+    ret 4
+
+;计算下一簇
+;参数1：当前簇
+;返回值在eax中
+ParaCurrClus    equ     4
+VarNextClus     equ     -4
+cal_next_cluster:
+    push bp
+    mov bp, sp
+    sub sp, 4
+    pushad
+    mov eax, [bp + ParaCluster]
     shl eax, 2
     mov edx, eax
     shr edx, 16
-    div word [bp + BPB_BytesPerSec - $$]    ;eax = FAT项所在扇区， edx = 扇区中偏移
-    cmp eax, [bp + FATCurrSecDisp]
+    div word [BPB_BytesPerSec]              ;eax = FAT项所在扇区， edx = 扇区中偏移
+    cmp eax, [BasePointer + FATCurrSecDisp]
     je get_next_cluster
-    mov [bp + FATCurrSecDisp], eax
-    add eax, dword [bp + FATSecDisp]
+    mov [BasePointer + FATCurrSecDisp], eax
+    add eax, dword [BasePointer + FATSecDisp]
     ;定位到有效FAT表
-    movzx ebx, word [bp + BPB_ExtFlags - $$]
+    movzx ebx, word [BPB_ExtFlags]
     test bx, 0x80
     jz load_fat32_sector
     and ebx, 0xf
-    cmp bl, [bp + BPB_NumFATs - $$]
+    cmp bl, [BPB_NumFATs]
     jae cal_next_cluster_err
     push edx
     mov ecx, eax
-    mov eax, dword [bp + BPB_FATSz32 - $$]
+    mov eax, dword [BPB_FATSz32]
     mul ebx
     add eax, ecx
     pop edx
 load_fat32_sector:
-    mov bx, FATOffset
-    mov cx, 1
+    push eax
+    push es
+    push FATOffset
+    push 1
     call load_sector
-    jc cal_next_cluster_err
 get_next_cluster:
     mov eax, [FATOffset + edx]
     and eax, 0x0FFFFFFF
-    pop bx
-    pop edx
-    pop cx
-    ret
+    mov [bp + VarNextClus], eax
+    popad
+    pop eax
+    leave
+    ret 4
 cal_next_cluster_err:
-    add sp, 12
-    jmp restart
+    mov word [bp + 2], restart
+    popad
+    leave
+    ret 4
 
-BootMgrSeg:     dw      0x2000
+struc   DiskAddressPacket
+    .size       resb    1   ;结构体大小
+    .reserved   resb    1   ;保留
+    .count      resw    1   ;传输扇区数目
+    .offset     resw    1   ;偏移
+    .base       resw    1   ;段基址
+    .start      resq    1   ;起始LBA
+endstruc
+;参数4：起始LBA
+;参数3：段基址
+;参数2：段偏移
+;参数1：数量
+ParaSecCnt  equ     4
+ParaOffset  equ     6
+ParaBase    equ     8
+ParaStart   equ     10
+VarDAP      equ     -DiskAddressPacket_size
+RetryCnt    equ     3
+load_sector:
+    push bp
+    mov bp, sp
+    push dword 0                ;在栈上构造DAP
+    sub sp, 10
+    push DiskAddressPacket_size
+    pushad
+    ;检测扇区编号
+    movzx eax, word [bp + ParaSecCnt]
+    add eax, [bp + ParaStart]
+    cmp eax, [BasePointer + TotSecDisp]
+    jae load_sector_err
+    mov di, RetryCnt
+    test byte [int13Ext], 0x01
+    jnz LBA_loading
+    mov bx, [bp + ParaOffset]
+CHS_loading:
+    mov ecx, [BPB_SecPerTrk]    ;扇区数和磁道数
+    push ecx
+    mov eax, [bp + ParaStart]
+    push eax
+    call LBA_to_CHS
+    mov dl, [BS_DrvNum]         ;每次转换都会修改dl
+CHS_retry:
+    push es                     ;只在读取时临时修改es
+    mov es, [bp + ParaBase]
+    mov ax, 0x0201
+    int 13h
+    pop es
+    jnc CHS_sector_loaded
+    dec di
+    je load_sector_err
+    xor ah, ah
+    int 13h
+    jmp CHS_retry
+CHS_sector_loaded:
+    add bx, [BPB_BytesPerSec]
+    inc dword [bp + ParaStart]
+    dec word [bp + ParaSecCnt]
+    jnz CHS_loading
+    jmp sector_loaded
+LBA_loading:
+    mov dl, [BS_DrvNum]
+    push di
+    lea si, [bp + ParaSecCnt]
+    lea di, [bp + VarDAP + 2]
+    mov cx, 10
+    repnz movsb
+    lea si, [bp + VarDAP]
+    pop di
+LBA_retry:
+    mov ah, 0x42
+    int 13h
+    jnc sector_loaded
+    dec di
+    je load_sector_err
+    xor ah, ah
+    int 13h
+    jmp LBA_retry
+load_sector_err:
+    mov word [bp + 2], restart
+sector_loaded:
+    popad
+    leave
+    ret 10
 
-BootMgr:        db      'BOOTMGR    ', 0x00
-AutoRun:        db      'AUTORUN INF', 0x00
-FileNotFound:   db      ' not found', 0x0D, 0x0A, 0x00
-    times 1022 - ($ - $$) db 0
+    times 1534 - ($ - $$) db 0
     db 0x55, 0xAA
